@@ -50,9 +50,7 @@ AsyncSessionLocal = async_sessionmaker(
 # ----------------------------------------------------------------------
 _MIGRATIONS: list[str] = [
     # 注：devices.cfg_json 已废弃（2026-10-08）。
-    #     三开关是设备本地状态，走 BLE 读写、不经云端，故不再存 cfg。
-    #     旧库里的该列由 deploy/migrations/drop_devices_cfg_json.py 一次性删除
-    #     （DROP COLUMN 没有 IF EXISTS 语义，不适合放进每次启动都跑的迁移列表）。
+    #     三开关权威状态在设备本地（BLE 读写），云端镜像改为独立快照表 device_cfg。
 
     # 1) sleep_frames（v2.3：30s 结构化数据帧）
     """CREATE TABLE IF NOT EXISTS sleep_frames (
@@ -71,6 +69,17 @@ _MIGRATIONS: list[str] = [
       PRIMARY KEY (id),
       KEY ix_frame_device_start (device_id, window_start_ts),
       KEY ix_frame_device_end (device_id, window_end_ts)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin""",
+
+    # 2) device_cfg（v2.4：三开关 cfg 云端快照，可查镜像非权威）
+    #    数据来源：evt:"cfg" 上行（BLE 切开关时设备补发）+ 每帧 cfg 字段兜底刷新
+    """CREATE TABLE IF NOT EXISTS device_cfg (
+      device_id  INT          NOT NULL,
+      cfg_json   TEXT         NOT NULL,
+      updated_at DATETIME(6)  NULL,
+      PRIMARY KEY (device_id),
+      CONSTRAINT fk_device_cfg_device FOREIGN KEY (device_id)
+        REFERENCES devices (id) ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin""",
 ]
 

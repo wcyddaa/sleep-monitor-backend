@@ -12,6 +12,7 @@
 
     {"evt":"online"}                     -> 自动注册 + 置在线
     {"evt":"frame", ...}                 -> 落 sleep_frames（顺带刷新 last_seen/在线）
+    {"evt":"cfg","cfg":{...}}            -> 刷 device_cfg 快照（BLE 切开关时设备补发）
     （无 evt，平台设备状态变更报文）      -> 按 status/event 字段置 在线/离线
 
 安全（可选）：设置 HTTP_WEBHOOK_TOKEN 后，需在请求头带上 X-Webhook-Token。
@@ -140,6 +141,13 @@ async def huawei_webhook(
             device_pk = device.id
         return {"code": 0, "message": "ok", "kind": "online", "device_id": device_id,
                 "device_pk": device_pk, "registered": True, "owner_bound": owner_bound}
+
+    # ---- B2) cfg 快照：BLE 切开关时设备补发（云端可查镜像，非权威；不补传）----
+    if evt == "cfg":
+        async with AsyncSessionLocal() as db:
+            cfg = await DeviceService.upsert_device_cfg(db, device_id, data.get("cfg") or {})
+        return {"code": 0, "message": "ok", "kind": "cfg",
+                "device_id": device_id, "cfg": cfg}
 
     # ---- C) 平台「设备状态变更」事件（上线/离线）----
     online_state = _deep_find_online_state(body)
@@ -338,5 +346,6 @@ async def huawei_frame_webhook(
     return {"code": 0, "message": "ok", "device_id": device_id, "frame_id": frame.id}
 
 
-# 注：原 POST /ingest/huawei/cfg 已删除 —— 三开关是设备本地状态（BLE 读写、
-#     不经云端），设备不再上行 /device/{id}/cfg 主题，也没有 cfg_json 可落。
+# 注：原 POST /ingest/huawei/cfg 已删除（2026-10-08）。v2.4 起恢复 cfg 上云，
+#     但不再需要独立端点：设备把 cfg 作为 evt:"cfg" 走同一个系统主题上行
+#     （见本文件 B2 分流），权威状态仍在设备本地 NVS，device_cfg 表只是快照。

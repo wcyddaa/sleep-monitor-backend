@@ -67,11 +67,34 @@ class Device(Base):
     )
     is_online: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    # 注：三开关（snore/stage/bcg）是设备本地状态，走 BLE 读写、不经云端，
-    #     故不在此表存 cfg。当前配置随每一帧上报（sleep_frames.raw_json 的 cfg 字段）。
+    # 注：三开关（snore/stage/bcg）的**权威**状态在设备本地 NVS（BLE 读写），
+    #     不存本表；云端可查镜像见 DeviceCfg（device_cfg 快照表）。
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     owner: Mapped[User] = relationship(back_populates="devices")
+
+
+class DeviceCfg(Base):
+    """设备三开关 cfg 的云端快照（可查镜像，非权威）。
+
+    权威源是设备本地 NVS（BLE 0x04/0x05 读写）；本表只存 IoTDA 上行的
+    evt:"cfg" 快照（BLE 切开关时设备补发一次）+ 每帧 cfg 字段兜底刷新的
+    最近值，供后端判断"某设备当前是否在监测"——换手机/多设备管理不依赖 BLE。
+    断网期间快照可能缺失/过期，设备不补发（过期 cfg 不应覆盖新状态）。
+    """
+
+    __tablename__ = "device_cfg"
+
+    device_id: Mapped[int] = mapped_column(
+        ForeignKey("devices.id", ondelete="CASCADE"), primary_key=True
+    )
+    # {"snore":0|1|2,"stage":0|1|2,"bcg":0|1|2}（OFF=0 / SIM=1 / REAL=2）
+    cfg_json: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow
+    )
+
+    device: Mapped[Device] = relationship()
 
 
 class DeviceCommand(Base):
@@ -137,7 +160,7 @@ class SleepRecord(Base):
     device: Mapped[Device] = relationship()
 
 
-__all__ = ["User", "Device", "DeviceCommand", "SleepRecord", "SleepFrame", "UserMessage", "DailyReportSummary"]
+__all__ = ["User", "Device", "DeviceCfg", "DeviceCommand", "SleepRecord", "SleepFrame", "UserMessage", "DailyReportSummary"]
 
 
 class SleepFrame(Base):

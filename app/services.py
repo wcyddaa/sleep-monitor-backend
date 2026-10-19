@@ -17,7 +17,7 @@ from app.agents import chat_graph, data_graph, report_graph, report_range_graph
 # _utcnow：models 里列默认值用的 UTC 取时函数，这里写入 last_seen 时复用，
 #          避免两处各写一份导致语义漂移。
 #          （此前 services.py 直接调 _utcnow() 却没导入 → NameError → webhook 500）
-from app.models import Device, DeviceCommand, SleepRecord, User, _utcnow
+from app.models import Device, DeviceCfg, DeviceCommand, SleepRecord, User, _utcnow
 from app.schemas import (
     ChatRequest,
     DeviceCreate,
@@ -412,15 +412,80 @@ class DeviceService:
         return {"frame": frame, "analysis": text}
 
     @staticmethod
+    async def upsert_device_cfg(
+        db: AsyncSession, device_id: str, cfg: dict
+    ) -> dict | None:
+        """落/刷新 device_cfg 快照（云端可查镜像，设备本地 NVS 仍是权威）。
+
+        两个数据来源：
+        - evt:"cfg" 帧上行（BLE 切开关时设备补发一次）
+        - 每帧 payload 里的 cfg 字段兜底刷新（快照缺失/过期时自愈）
+
+        设备未注册（IoTDA 侧乱造的 device_id）→ 静默跳过，不为它建设备。
+        """
+        device = await DeviceService.get_by_device_id(db, device_id)
+        if device is None:
+            return None
+        cfg_json = json.dumps(cfg, ensure_ascii=False)
+        row = (
+            await db.execute(select(DeviceCfg).where(DeviceCfg.device_id == device.id))
+        ).scalar_one_or_none()
+        if row is None:
+            db.add(DeviceCfg(device_id=device.id, cfg_json=cfg_json))
+        else:
+            row.cfg_json = cfg_json
+            row.updated_at = _utcnow()
+        await db.commit()
+        return cfg
+
+    @staticmethod
     async def write_frame_from_webhook(
         db: AsyncSession, device_id: str, payload: dict
     ):
-        """IoTDA 规则引擎推送的 30s 帧：自动注册设备 + 写一行 sleep_frames。"""
+        """IoTDA 规则引擎推送的 30s 帧：自动注册设备 + 写一行 sleep_frames。
+
+        幂等去重：端侧断网缓存补传后，同一帧可能重复合流（实时 + 补传），
+        按 (device_id, window_start_ts) 判重 —— 已存在则只刷新设备在线状态，
+        不再重复落行。索引 ix_frame_device_start 支撑该查询。
+
+        结构化列只存窗口级统计；鼾声事件明细 snore_events[{s,e}]
+        （端侧状态机产出）随 raw_json 原样落库，"打鼾次数/平均间隔"
+        等指标由 DataAgent/报告端从 raw_json 直接统计，无需反推。
+        """
         device, _ = await DeviceService.get_or_create_webhook(db, device_id)
         from app.models import SleepFrame
+
+        window_start_ts = int(payload.get("start", 0))
+        existing = (
+            await db.execute(
+                select(SleepFrame)
+                .where(
+                    SleepFrame.device_id == device.id,
+                    SleepFrame.window_start_ts == window_start_ts,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            # 重复帧（补传与实时并发竞态等）：不重插、不重复触发事件
+            device.last_seen = _utcnow()
+            device.is_online = True
+            await db.commit()
+            logger.info(
+                "重复帧丢弃: device=%s start=%s（已有 frame_id=%s）",
+                device_id, window_start_ts, existing.id,
+            )
+            cfg_payload = payload.get("cfg")
+            if isinstance(cfg_payload, dict):
+                try:
+                    await DeviceService.upsert_device_cfg(db, device_id, cfg_payload)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("刷新 device_cfg 快照失败: %s", e)
+            return existing
+
         frame = SleepFrame(
             device_id=device.id,
-            window_start_ts=int(payload.get("start", 0)),
+            window_start_ts=window_start_ts,
             window_end_ts=int(payload.get("end", 0)),
             stage=int(payload.get("stage", -1)),
             heart_rate=int(payload.get("hr", -1)),
@@ -434,6 +499,14 @@ class DeviceService:
         device.last_seen = _utcnow()
         device.is_online = True
         await db.commit()
+
+        # ★ 顺手刷新 cfg 快照（每帧 cfg 字段兜底：evt:"cfg" 缺失/过期时自愈）
+        cfg_payload = payload.get("cfg")
+        if isinstance(cfg_payload, dict):
+            try:
+                await DeviceService.upsert_device_cfg(db, device_id, cfg_payload)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("刷新 device_cfg 快照失败: %s", e)
 
         # ★ 事件源：重度鼾声（单帧 snore_sec >= 25）
         snore_sec = int(payload.get("snore_sec", -1))
