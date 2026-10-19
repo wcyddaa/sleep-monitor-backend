@@ -1,0 +1,13 @@
+#!/bin/bash
+set -e
+
+# 阿里云函数计算「自定义运行时」入口
+# - 依赖放在「层」中，层被解压到 /opt，Python 包位于 /opt/python
+# - 自定义运行时不会自动把 /opt/python 加入 sys.path，需手动加
+# - /code 只读，SQLite 需写 /tmp（由环境变量 DATABASE_URL 指定）
+export PYTHONPATH="/opt/python:${PYTHONPATH}"
+
+cd /code
+# 注意：函数运行环境请选「内置 Python 3.12」（FC 内置 Python 最高 3.12，无 3.13）。
+# 内置运行时下 python3 就是 3.12，与依赖层构建版本一致，避免编译型依赖 ABI 不匹配。
+exec python3 -m uvicorn main:app --host 0.0.0.0 --port 9000 --no-access-log

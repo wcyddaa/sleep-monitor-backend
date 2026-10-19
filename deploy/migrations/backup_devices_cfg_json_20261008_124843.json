@@ -1,0 +1,12 @@
+{
+  "dropped_at": "2026-10-08T12:48:43",
+  "table": "devices",
+  "column": "cfg_json",
+  "rows": [
+    {
+      "id": 150001,
+      "device_id": "690ae11fe41f2979315ed4e3_stm32f407-esp8266",
+      "cfg_json": "{\"snore\": 1, \"stage\": 1, \"bcg\": 1}"
+    }
+  ]
+}
