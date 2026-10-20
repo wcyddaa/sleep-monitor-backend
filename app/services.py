@@ -10,7 +10,7 @@ import json
 import logging
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents import chat_graph, data_graph, report_graph, report_range_graph
@@ -268,7 +268,24 @@ class DeviceService:
 
     @staticmethod
     async def get_runtime(db: AsyncSession, device: Device) -> DeviceRuntime:
-        """依据最近一条睡眠记录推断实时状态。"""
+        """设备实时运行状态。
+
+        ★ v1.0 主链路：设备每 30s 经 IoTDA webhook 落一帧 sleep_frames，
+          实时指标优先取最近一帧（30s 级实时性）；
+          SleepRecord 仅作为旧数据源回退（无帧时兜底）。
+          schema 字段不变，前端 deviceAPI.js 的字段映射无需改动。
+        """
+        from app.models import SleepFrame
+
+        frame = (
+            await db.execute(
+                select(SleepFrame)
+                .where(SleepFrame.device_id == device.id)
+                .order_by(SleepFrame.window_end_ts.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+
         latest = (
             await db.execute(
                 select(SleepRecord)
@@ -278,29 +295,61 @@ class DeviceService:
             )
         ).scalar_one_or_none()
 
+        hr = rr = None
         latest_bed_status: str | None = None
         latest_turnover_count: int | None = None
-        if latest and latest.raw_data:
+
+        if frame is not None:
+            # -1 = 该通道本帧不可用，不能当真实指标返回
+            if frame.heart_rate is not None and frame.heart_rate >= 0:
+                hr = float(frame.heart_rate)
+            if frame.resp_rate is not None and frame.resp_rate >= 0:
+                rr = float(frame.resp_rate)
+            # 在床判定：设备在线且 10 分钟内仍有帧产出 → 在床；否则按离床
+            now_ts = int(_utcnow().timestamp())
+            fresh = bool(device.is_online) and frame.window_end_ts >= now_ts - 600
+            latest_bed_status = "in_bed" if fresh else "out_of_bed"
+
+        # ---- 回退：无帧时沿用旧 SleepRecord 逻辑（avg 心率呼吸 / vital_signs）----
+        if hr is None and latest is not None and latest.avg_heart_rate is not None:
+            hr = float(latest.avg_heart_rate)
+        if rr is None and latest is not None and latest.avg_respiratory_rate is not None:
+            rr = float(latest.avg_respiratory_rate)
+        if latest is not None and latest.raw_data:
             vs = latest.raw_data.get("vital_signs") or []
-            if vs:
+            if vs and latest_bed_status is None:
                 latest_bed_status = vs[-1].get("bed_status")
-            # 翻身次数：优先用分析特征，否则累加原始样本
             feats = (latest.analysis or {}).get("features") or {}
-            latest_turnover_count = feats.get("total_turnovers")
             if latest_turnover_count is None:
-                latest_turnover_count = sum(
-                    int(v.get("turnover_count") or 0) for v in vs
+                latest_turnover_count = feats.get("total_turnovers")
+                if latest_turnover_count is None:
+                    latest_turnover_count = sum(
+                        int(v.get("turnover_count") or 0) for v in vs
+                    )
+
+        # 帧链路翻身次数：统计最近 24h 内 motion>0 的窗口数
+        #（30s 一窗，motion>0 即该窗口发生过体动/翻身）
+        if frame is not None:
+            since = int(_utcnow().timestamp()) - 24 * 3600
+            total = (
+                await db.execute(
+                    select(func.count()).select_from(SleepFrame).where(
+                        SleepFrame.device_id == device.id,
+                        SleepFrame.window_end_ts >= since,
+                        SleepFrame.motion > 0,
+                    )
                 )
+            ).scalar_one()
+            latest_turnover_count = int(total)
 
         return DeviceRuntime(
             is_online=device.is_online,
             last_seen=device.last_seen,
-            latest_heart_rate=latest.avg_heart_rate if latest else None,
-            latest_respiratory_rate=latest.avg_respiratory_rate if latest else None,
+            latest_heart_rate=hr,
+            latest_respiratory_rate=rr,
             latest_bed_status=latest_bed_status,
             latest_turnover_count=latest_turnover_count,
         )
-
     @staticmethod
     async def create_command(
         db: AsyncSession, owner: User, device_pk: int, command: str, value: Any | None
